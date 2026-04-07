@@ -1,6 +1,6 @@
 // ============================================================
 // gpu/CUDA_Collisions.cu — GPU-accelerated collision detection
-// WEEK 4 IMPLEMENTATION (stub — fill in during Week 4)
+// CUDA kernel: one block per bullet, threads iterate zombies
 // ============================================================
 
 #ifdef USE_CUDA
@@ -9,25 +9,21 @@
 #include <cstdio>
 #include <cmath>
 
-// Forward declarations of host-side wrappers
-// These will be called from Processors.h via checkCollisionsGPU()
+extern "C++" {
+    #include "../include/Entities.h"
+    #include "../include/Processors.h"
+    #include <vector>
+}
 
 // ===================== CUDA Kernel =====================
-// Each thread checks ONE (bullet, zombie) pair.
-// Grid:   bulletCount  blocks
-// Block:  min(zombieCount, 256)  threads
-//
-// Algorithm:
-//   tid = blockIdx.x * blockDim.x + threadIdx.x
-//   bullet_index = blockIdx.x
-//   zombie_index = threadIdx.x  (with grid-stride loop)
-//   if distance(bullet, zombie) < threshold → mark both as dead.
-
+// Grid:  bulletCount blocks
+// Block: up to 256 threads — each checks (zombieCount / blockDim.x) zombies
 __global__ void collisionKernel(
-    const float* bx, const float* by, bool* bAlive,
-    const float* zx, const float* zy, bool* zAlive, int* zHealth,
+    const float* __restrict__ bx, const float* __restrict__ by, bool* bAlive,
+    const float* __restrict__ zx, const float* __restrict__ zy,
+    bool* zAlive, int* zHealth,
     int bulletCount, int zombieCount,
-    float threshold)
+    float threshold2)   // pass squared threshold so no sqrt needed
 {
     int bi = blockIdx.x;
     if (bi >= bulletCount || !bAlive[bi]) return;
@@ -37,93 +33,86 @@ __global__ void collisionKernel(
 
         float dx = bx[bi] - zx[zi];
         float dy = by[bi] - zy[zi];
-        float dist = sqrtf(dx * dx + dy * dy);
 
-        if (dist < threshold) {
+        if (dx * dx + dy * dy < threshold2) {
             bAlive[bi] = false;
-            // Atomic decrement so multiple bullets don't corrupt health
             int prev = atomicSub(&zHealth[zi], 1);
             if (prev <= 1) zAlive[zi] = false;
-            return; // This bullet is consumed
+            return;
         }
     }
 }
 
 // ===================== Host Wrapper =====================
-// Called from Game.cpp when mode == GPU
-
-// Include the project header inside an extern "C++" block so nvcc
-// can see the struct definitions.
-extern "C++" {
-    #include "../include/Entities.h"
-    #include "../include/Processors.h"
-}
-
-void checkCollisionsGPU(BulletPool& b, ZombieSwarm& z, Player& p)
+void checkCollisionsGPU(BulletPool& b, ZombieSwarm& z, Player& p,
+                         const std::vector<Obstacle>& obstacles)
 {
     if (b.count == 0 || z.count == 0) return;
 
-    // --- Device memory ---
+    // CPU: bullet vs obstacle (cheap, only ~8 buildings)
+    for (int bi = 0; bi < b.count; bi++) {
+        if (!b.isAlive[bi]) continue;
+        for (const auto& obs : obstacles) {
+            if (obs.intersects(b.x[bi], b.y[bi], BULLET_RADIUS)) {
+                b.isAlive[bi] = false;
+                break;
+            }
+        }
+    }
+
+    // Allocate device memory
     float *d_bx, *d_by, *d_zx, *d_zy;
     bool  *d_bAlive, *d_zAlive;
     int   *d_zHealth;
 
-    size_t bBytes  = b.count * sizeof(float);
-    size_t zBytes  = z.count * sizeof(float);
-    size_t zbBytes = b.count * sizeof(bool);
-    size_t zzBytes = z.count * sizeof(bool);
-    size_t zhBytes = z.count * sizeof(int);
+    size_t bSz  = b.count * sizeof(float);
+    size_t zSz  = z.count * sizeof(float);
+    size_t bzSz = b.count * sizeof(bool);
+    size_t zzSz = z.count * sizeof(bool);
+    size_t zhSz = z.count * sizeof(int);
 
-    cudaMalloc(&d_bx, bBytes);
-    cudaMalloc(&d_by, bBytes);
-    cudaMalloc(&d_zx, zBytes);
-    cudaMalloc(&d_zy, zBytes);
-    cudaMalloc(&d_bAlive, zbBytes);
-    cudaMalloc(&d_zAlive, zzBytes);
-    cudaMalloc(&d_zHealth, zhBytes);
+    cudaMalloc(&d_bx,     bSz);
+    cudaMalloc(&d_by,     bSz);
+    cudaMalloc(&d_zx,     zSz);
+    cudaMalloc(&d_zy,     zSz);
+    cudaMalloc(&d_bAlive, bzSz);
+    cudaMalloc(&d_zAlive, zzSz);
+    cudaMalloc(&d_zHealth, zhSz);
 
-    // --- Copy Host → Device ---
-    cudaMemcpy(d_bx,     b.x,       bBytes,  cudaMemcpyHostToDevice);
-    cudaMemcpy(d_by,     b.y,       bBytes,  cudaMemcpyHostToDevice);
-    cudaMemcpy(d_zx,     z.x,       zBytes,  cudaMemcpyHostToDevice);
-    cudaMemcpy(d_zy,     z.y,       zBytes,  cudaMemcpyHostToDevice);
-    cudaMemcpy(d_bAlive, b.isAlive, zbBytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_zAlive, z.isAlive, zzBytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_zHealth, z.health, zhBytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bx,      b.x,       bSz,  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_by,      b.y,       bSz,  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_zx,      z.x,       zSz,  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_zy,      z.y,       zSz,  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bAlive,  b.isAlive, bzSz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_zAlive,  z.isAlive, zzSz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_zHealth, z.health,  zhSz, cudaMemcpyHostToDevice);
 
-    // --- Launch kernel ---
     int threads = 256;
-    int blocks  = b.count;
-    float threshold = ZOMBIE_RADIUS + BULLET_RADIUS;
+    float t = ZOMBIE_RADIUS + BULLET_RADIUS;
+    float threshold2 = t * t;
 
-    collisionKernel<<<blocks, threads>>>(
+    collisionKernel<<<b.count, threads>>>(
         d_bx, d_by, d_bAlive,
         d_zx, d_zy, d_zAlive, d_zHealth,
-        b.count, z.count, threshold);
+        b.count, z.count, threshold2);
 
     cudaDeviceSynchronize();
 
-    // --- Copy Device → Host ---
-    cudaMemcpy(b.isAlive, d_bAlive, zbBytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(z.isAlive, d_zAlive, zzBytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(z.health,  d_zHealth, zhBytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(b.isAlive, d_bAlive,  bzSz, cudaMemcpyDeviceToHost);
+    cudaMemcpy(z.isAlive, d_zAlive,  zzSz, cudaMemcpyDeviceToHost);
+    cudaMemcpy(z.health,  d_zHealth, zhSz, cudaMemcpyDeviceToHost);
 
-    // --- Free device memory ---
-    cudaFree(d_bx);
-    cudaFree(d_by);
-    cudaFree(d_zx);
-    cudaFree(d_zy);
-    cudaFree(d_bAlive);
-    cudaFree(d_zAlive);
-    cudaFree(d_zHealth);
+    cudaFree(d_bx); cudaFree(d_by);
+    cudaFree(d_zx); cudaFree(d_zy);
+    cudaFree(d_bAlive); cudaFree(d_zAlive); cudaFree(d_zHealth);
 
-    // --- Zombie vs Player (trivial — stays on CPU) ---
+    // CPU: zombie vs player
+    const float touchP2 = (PLAYER_RADIUS + ZOMBIE_RADIUS) * (PLAYER_RADIUS + ZOMBIE_RADIUS);
     for (int i = 0; i < z.count; i++) {
         if (!z.isAlive[i]) continue;
-        float dx   = p.x - z.x[i];
-        float dy   = p.y - z.y[i];
-        float dist = sqrtf(dx * dx + dy * dy);
-        if (dist < PLAYER_RADIUS + ZOMBIE_RADIUS) {
+        float dx = p.x - z.x[i];
+        float dy = p.y - z.y[i];
+        if (dx * dx + dy * dy < touchP2) {
             if (p.invincibleTimer <= 0.0f) {
                 p.health -= 10;
                 p.invincibleTimer = 0.5f;
